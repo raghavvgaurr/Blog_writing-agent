@@ -1,0 +1,24 @@
+# API Keys and environment variables
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# UV
+.uv/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Generated outputs
+output/
+generated_blogs/

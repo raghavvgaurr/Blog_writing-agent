@@ -1,0 +1,29 @@
+[project]
+name = "blog-writing-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "duckduckgo-search>=8.1.1",
+    "fastapi>=0.165.0",
+    "google-api-python-client>=2.202.0",
+    "google-auth>=2.63.0",
+    "google-auth-httplib2>=0.4.4",
+    "google-auth-oauthlib>=1.5.0",
+    "httpx>=0.28.1",
+    "langchain>=1.5.2",
+    "langchain-google-genai>=4.5.2",
+    "langchain-groq>=1.2.1",
+    "langgraph>=1.2.24",
+    "pydantic>=2.14.4",
+    "pytest>=9.2.0",
+    "python-dotenv>=1.2.4",
+    "requests>=2.34.2",
+    "rich>=15.0.0",
+    "ruff>=0.17.6",
+    "streamlit>=1.67.0",
+    "tavily-python>=0.8.5",
+    "uvicorn>=0.54.0",
+]
