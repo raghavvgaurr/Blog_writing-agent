@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import operator
+from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
 from pydantic import BaseModel, Field
-from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from langchain_ollama import ChatOllama
 
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_community.tools.tavily_search import TavilySearchResults
 # -----------------------------
 # 1) Schemas
@@ -77,7 +79,42 @@ class State(TypedDict):
 # -----------------------------
 # 2) LLM
 # -----------------------------
-llm = ChatOllama(model='llama3.2:1b')
+# Llama 3.2 1B is the default. The Streamlit app can select another installed model per run.
+llm = ChatOllama(model="llama3.2:1b")
+
+
+@lru_cache(maxsize=4)
+def _chat_model(model_name: str):
+    return ChatOllama(model=model_name)
+
+
+def _model_for(config: Optional[RunnableConfig] = None):
+    configurable = (config or {}).get("configurable", {})
+    model_name = configurable.get("ollama_model")
+    return _chat_model(model_name) if model_name else llm
+
+
+def _model_name(config: Optional[RunnableConfig] = None) -> str:
+    return ((config or {}).get("configurable", {}) or {}).get("ollama_model", "llama3.2:1b")
+
+
+def output_path_for_title(title: str) -> Path:
+    safe_title = "".join(char for char in title if char.isalnum() or char in " _-.").strip(" .")
+    safe_title = "_".join(safe_title.split())
+    return (Path(__file__).resolve().parent / f"{safe_title}.md").resolve()
+
+
+def _emit_progress(
+    config: Optional[RunnableConfig], stage: str, message: str, **details
+) -> None:
+    callback = ((config or {}).get("configurable", {}) or {}).get("progress_callback")
+    if callback:
+        callback({
+            "stage": stage,
+            "message": message,
+            "details": details,
+            "time": datetime.now().astimezone().strftime("%H:%M:%S"),
+        })
 # -----------------------------
 # 3) Router (decide upfront)
 # -----------------------------
@@ -99,10 +136,18 @@ If needs_research=true:
 - If user asked for "last week/this week/latest", reflect that constraint IN THE QUERIES.
 """
 
-def router_node(state: State) -> dict:
-    
+def router_node(state: State, config: Optional[RunnableConfig] = None) -> dict:
     topic = state["topic"]
-    decider = llm.with_structured_output(RouterDecision)
+    configurable = (config or {}).get("configurable", {})
+    research_preference = configurable.get("research_preference", "automatic")
+    if research_preference == "never":
+        _emit_progress(config, "router", "Web research is disabled; skipping the research router.")
+        _emit_progress(config, "router_done", "Web research disabled in settings; skipping Tavily.", needs_research=False, query_count=0)
+        return {"needs_research": False, "mode": "closed_book", "queries": []}
+
+    _emit_progress(config, "router", "Asking the local model whether this topic needs fresh sources.", tool="Ollama / ChatOllama", model=_model_name(config))
+    model = _model_for(config)
+    decider = model.with_structured_output(RouterDecision)
     decision = decider.invoke(
         [
             SystemMessage(content=ROUTER_SYSTEM),
@@ -110,10 +155,31 @@ def router_node(state: State) -> dict:
         ]
     )
 
+    needs_research = decision.needs_research
+    mode = decision.mode
+    queries = decision.queries
+
+    if research_preference == "always":
+        needs_research = True
+        if not queries:
+            queries = [
+                topic,
+                f"{topic} official documentation",
+                f"{topic} recent developments",
+            ]
+        if mode == "closed_book":
+            mode = "hybrid"
+    _emit_progress(
+        config,
+        "router_done",
+        f"Research decision: {mode.replace('_', ' ')}.",
+        needs_research=needs_research,
+        query_count=len(queries),
+    )
     return {
-        "needs_research": decision.needs_research,
-        "mode": decision.mode,
-        "queries": decision.queries,
+        "needs_research": needs_research,
+        "mode": mode,
+        "queries": queries,
     }
 
 def route_next(state: State) -> str:
@@ -153,21 +219,24 @@ Rules:
 - Deduplicate by URL.
 """
 
-def research_node(state: State) -> dict:
-
-    # take the first 10 queries from state
-    queries = (state.get("queries", []) or [])
+def research_node(state: State, config: Optional[RunnableConfig] = None) -> dict:
+    queries = (state.get("queries", []) or [])[:10]
     max_results = 6
-
     raw_results: List[dict] = []
+    _emit_progress(config, "research_start", f"Starting web research with {len(queries)} search queries.", query_count=len(queries))
 
-    for q in queries:
-        raw_results.extend(_tavily_search(q, max_results=max_results))
+    for index, query in enumerate(queries, start=1):
+        _emit_progress(config, "tool_call", f"Calling Tavily search {index}/{len(queries)}.", tool="TavilySearchResults", query=query, search_index=index, total_queries=len(queries))
+        results = _tavily_search(query, max_results=max_results)
+        raw_results.extend(results)
+        _emit_progress(config, "tool_result", f"Tavily returned {len(results)} results for search {index}.", tool="TavilySearchResults", query=query, search_index=index, total_queries=len(queries), result_count=len(results))
 
     if not raw_results:
+        _emit_progress(config, "research_done", "No search results came back; continuing with an empty evidence pack.", result_count=0)
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack)
+    _emit_progress(config, "synthesis", f"Organizing {len(raw_results)} search results into cited evidence.", tool="Ollama / ChatOllama", model=_model_name(config), result_count=len(raw_results))
+    extractor = _model_for(config).with_structured_output(EvidencePack)
     pack = extractor.invoke(
         [
             SystemMessage(content=RESEARCH_SYSTEM),
@@ -181,6 +250,7 @@ def research_node(state: State) -> dict:
         if e.url:
             dedup[e.url] = e
 
+    _emit_progress(config, "research_done", f"Research complete: {len(dedup)} unique sources retained.", source_count=len(dedup))
     return {"evidence": list(dedup.values())}
 # -----------------------------
 # 5) Orchestrator (Plan)
@@ -220,8 +290,9 @@ Grounding rules:
 Output must strictly match the Plan schema.
 """
 
-def orchestrator_node(state: State) -> dict:
-    planner = llm.with_structured_output(Plan)
+def orchestrator_node(state: State, config: Optional[RunnableConfig] = None) -> dict:
+    _emit_progress(config, "planning", "Asking the local model to build the outline.", tool="Ollama / ChatOllama", model=_model_name(config))
+    planner = _model_for(config).with_structured_output(Plan)
 
     evidence = state.get("evidence", [])
     mode = state.get("mode", "closed_book")
@@ -240,6 +311,7 @@ def orchestrator_node(state: State) -> dict:
         ]
     )
 
+    _emit_progress(config, "plan_ready", f"Outline ready with {len(plan.tasks)} sections.", section_count=len(plan.tasks), title=plan.blog_title)
     return {"plan": plan}
 # -----------------------------
 # 6) Fanout
@@ -292,9 +364,9 @@ Style:
 - Avoid fluff/marketing. Be precise and implementation-oriented.
 """
 
-def worker_node(payload: dict) -> dict:
-    
+def worker_node(payload: dict, config: Optional[RunnableConfig] = None) -> dict:
     task = Task(**payload["task"])
+    _emit_progress(config, "section_start", f"Writing section {task.id}: {task.title}.", tool="Ollama / ChatOllama", model=_model_name(config), task_id=task.id, title=task.title)
     plan = Plan(**payload["plan"])
     evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
     topic = payload["topic"]
@@ -309,7 +381,7 @@ def worker_node(payload: dict) -> dict:
             for e in evidence[:20]
         )
 
-    section_md = llm.invoke(
+    section_md = _model_for(config).invoke(
         [
             SystemMessage(content=WORKER_SYSTEM),
             HumanMessage(
@@ -335,24 +407,22 @@ def worker_node(payload: dict) -> dict:
         ]
     ).content.strip()
 
+    _emit_progress(config, "section_done", f"Finished section {task.id}: {task.title}.", task_id=task.id, title=task.title)
     return {"sections": [(task.id, section_md)]}
 # -----------------------------
 # 8) Reducer (merge + save)
 # -----------------------------
-def reducer_node(state: State) -> dict:
-
+def reducer_node(state: State, config: Optional[RunnableConfig] = None) -> dict:
     plan = state["plan"]
+    _emit_progress(config, "saving", "Combining the sections and saving the Markdown file.")
 
     ordered_sections = [md for _, md in sorted(state["sections"], key=lambda x: x[0])]
     body = "\n\n".join(ordered_sections).strip()
     final_md = f"# {plan.blog_title}\n\n{body}\n"
 
-    title = plan.blog_title
-    safe_title = "".join(char for char in title if char.isalnum() or char in " _-.").strip(" .")
-    safe_title = "_".join(safe_title.split())
-    output_path = (Path.cwd().resolve() / f"{safe_title}.md").resolve()
+    output_path = output_path_for_title(plan.blog_title)
     output_path.write_text(final_md, encoding="utf-8")
-    print(f"Saved blog to: {output_path}")
+    _emit_progress(config, "saved", f"Blog saved to {output_path}.", output_path=str(output_path))
     
 
 
